@@ -19,7 +19,7 @@ from typing import Any
 
 from app.models import (
     AntiBlockStrategy, AntiType, ArchiveFormat, ArchivePolicy, CleanedContent,
-    CleanRule, CostRecord, CrawlJobSpec, CrawlLimitRule, DeliveryFormat,
+    CleanRule, CleanType, CostRecord, CrawlJobSpec, CrawlLimitRule, DeliveryFormat,
     DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry,
     ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
     SchedulePlan, SiteConfig, SiteType, StorageBatch, UrlFingerprint,
@@ -492,27 +492,53 @@ def schedule_job(job: CrawlJobSpec) -> SchedulePlan | None:
 # ---------------------------------------------------------------------------
 
 def recover_failed_batch(batch: StorageBatch) -> StorageBatch | None:
-    """恢复失败的批次：重新对缺失记录执行抽取和清洗。"""
+    """恢复失败批次（保留的兼容入口）。
+
+    旧实现会把空字段直接写成 ``recovered:<字段>`` 并标记通过，导致恢复后的摘要与
+    实际网页对不上。现在恢复必须以实际采集响应为输入做清洗重放：
+    - 批次已登记实际响应快照时，交给失败批更正重放服务按规则重放；
+    - 没有任何实际响应时，不允许伪造占位值，批次保持校验失败并在批次上留存原因，
+      等待值班员找回原批响应或完成补采后再重放。
+    """
     if batch.status != "校验失败":
         return None
 
-    # 找出失败记录
     failed_records = [r for r in batch.records if not r.is_valid()]
     if not failed_records:
         return None
 
-    # 重试：对失败记录重新填充缺失字段
-    for record in failed_records:
-        for field, value in list(record.fields.items()):
-            if not value or value == "":
-                record.fields[field] = f"recovered:{field}"
-        # 恢复后清除之前清洗错误标记
-        record.clean_errors = []
+    has_response = any(
+        batch.response_snapshots.get(r.source_url)
+        and any(s.available and s.body for s in batch.response_snapshots[r.source_url])
+        for r in failed_records
+    )
+    if not has_response:
+        # 无实际响应：占位结果不通过，只保留未通过原因，不改动既有字段与摘要
+        batch.recovery_blockers = {
+            r.source_url: "无实际采集响应，禁止使用 recovered 占位值恢复"
+            for r in failed_records
+        }
+        return batch
 
-    # 重新校验
-    batch.checksum = batch.compute_checksum()
-    batch.status = "校验通过" if all(r.is_valid() for r in batch.records) else "校验失败"
-    batch.stored_at = datetime.now(timezone.utc).isoformat()
+    # 延迟导入避免 services ↔ integration 的循环依赖
+    from app.models import CleanRule, ExtractRule
+    from app.services.batch_recovery import replay_failed_batch
+
+    rule = ExtractRule(
+        rule_id=failed_records[0].extract_rule_id or "CONT-REPLAY",
+        target_site="",
+        xpath_selector="//title|//h1|//body",
+        field_mapping={"raw": "title,body,publish_date"},
+        status="生效中",
+    )
+    clean_rules = [
+        CleanRule(
+            rule_id=f"FIEL-REPLAY-{index}", target_field=field_name,
+            clean_type=CleanType.TRIM, null_strategy="skip", status="生效中",
+        )
+        for index, field_name in enumerate(("title", "body", "publish_date"))
+    ]
+    replay_failed_batch(batch, rule, clean_rules)
     return batch
 
 

@@ -257,9 +257,9 @@ def test_clean_multiple_rules() -> None:
 # ---------------------------------------------------------------------------
 
 def test_recover_failed_batch() -> None:
-    """恢复失败批次：填充缺失和空字段后校验通过。"""
+    """恢复失败批次：无实际响应时禁止伪造 recovered 占位值，批次保持校验失败。"""
     # record1: 有效字段
-    # record2: 空字段导致 is_valid() 返回 False
+    # record2: 空字段导致 is_valid() 返回 False，且批次未留存任何实际响应
     records = [
         CleanedContent(source_url="url1", extract_rule_id="R1",
                        fields={"body": "content"}, clean_errors=[]),
@@ -275,9 +275,16 @@ def test_recover_failed_batch() -> None:
 
     recovered = recover_failed_batch(batch)
 
-    assert recovered is not None, "应有恢复结果"
-    assert recovered.status == "校验通过", f"恢复后应通过校验，实际: {recovered.status}"
-    assert recovered.checksum != "old_checksum", "校验摘要应更新"
+    assert recovered is not None, "无响应时应返回带阻断原因的批次而非静默成功"
+    assert recovered.status == "校验失败", \
+        f"无实际响应不允许占位通过，实际: {recovered.status}"
+    assert "url2" in recovered.recovery_blockers, "未通过原因必须逐行保留"
+    # 不得再出现伪造的 recovered: 标题
+    assert all(
+        not str(value).startswith("recovered:")
+        for record in recovered.records for value in record.fields.values()
+    ), "恢复结果中不允许出现 recovered: 占位值"
+    assert recovered.checksum == "old_checksum", "未通过重放不应改写校验摘要"
 
 
 def test_recover_already_valid_batch() -> None:

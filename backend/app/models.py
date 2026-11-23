@@ -286,6 +286,8 @@ class CleanedContent:
     fields: dict[str, Any] = field(default_factory=dict)
     clean_errors: list[str] = field(default_factory=list)
     cleaned_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    # 溯源信息：字段结果必须能回查实际响应与清洗规则，不允许无来源的占位值
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     def is_valid(self) -> bool:
         if len(self.clean_errors) > 0:
@@ -293,6 +295,106 @@ class CleanedContent:
         if len(self.fields) == 0:
             return False
         return all(v for v in self.fields.values())
+
+
+@dataclass
+class CapturedResponse:
+    """实际采集响应快照：保存原始 HTTP 响应，供字段结果回查与重放。
+
+    origin 取值：
+    - original_capture：原批采集时留存的响应（原批证据）
+    - supplemental：值班员后续补采取得的响应（后续补采）
+    """
+    snapshot_id: str
+    source_url: str
+    origin: str
+    http_status: int = 200
+    body: str = ""
+    captured_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    available: bool = True
+    failure_reason: str = ""
+
+    ORIGIN_LABELS = {
+        "original_capture": "原批证据",
+        "supplemental": "后续补采",
+    }
+
+    @property
+    def origin_label(self) -> str:
+        return self.ORIGIN_LABELS.get(self.origin, self.origin)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "source_url": self.source_url,
+            "origin": self.origin,
+            "origin_label": self.origin_label,
+            "http_status": self.http_status,
+            "body": self.body,
+            "captured_at": self.captured_at,
+            "available": self.available,
+            "failure_reason": self.failure_reason,
+        }
+
+
+@dataclass
+class ReplayLineResult:
+    """失败批更正回执中的逐行重放结果。"""
+    source_url: str
+    passed: bool
+    fields: dict[str, Any] = field(default_factory=dict)
+    clean_errors: list[str] = field(default_factory=list)
+    failure_reason: str = ""
+    chosen_snapshot_id: str | None = None
+    chosen_origin: str = ""
+    # 回查链路：实际响应快照、HTTP 状态、抽取规则、清洗规则、被否决的快照
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def chosen_origin_label(self) -> str:
+        return CapturedResponse.ORIGIN_LABELS.get(self.chosen_origin, self.chosen_origin)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_url": self.source_url,
+            "passed": self.passed,
+            "fields": dict(self.fields),
+            "clean_errors": list(self.clean_errors),
+            "failure_reason": self.failure_reason,
+            "chosen_snapshot_id": self.chosen_snapshot_id,
+            "chosen_origin": self.chosen_origin,
+            "chosen_origin_label": self.chosen_origin_label,
+            "evidence": dict(self.evidence),
+        }
+
+
+@dataclass
+class FailureCorrectionReceipt:
+    """失败批更正回执：重放明细、标题冲突裁决与正确版本摘要的唯一取数来源。"""
+    receipt_id: str
+    batch_id: str
+    replayed_at: str
+    overall_passed: bool
+    previous_checksum: str
+    corrected_checksum: str
+    signature: str
+    lines: list[ReplayLineResult] = field(default_factory=list)
+    title_conflicts: list[dict[str, Any]] = field(default_factory=list)
+    priority: list[str] = field(default_factory=lambda: ["original_capture", "supplemental"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "receipt_id": self.receipt_id,
+            "batch_id": self.batch_id,
+            "replayed_at": self.replayed_at,
+            "overall_passed": self.overall_passed,
+            "previous_checksum": self.previous_checksum,
+            "corrected_checksum": self.corrected_checksum,
+            "signature": self.signature,
+            "priority": list(self.priority),
+            "lines": [line.to_dict() for line in self.lines],
+            "title_conflicts": [dict(item) for item in self.title_conflicts],
+        }
 
 
 @dataclass
@@ -308,6 +410,14 @@ class StorageBatch:
     stored_at: str = ""
     status: str = "采集中"
     records: list[CleanedContent] = field(default_factory=list)
+    # 失败批更正：同一次更正的回执（存储与明细均从这份回执取数）
+    correction_receipt: FailureCorrectionReceipt | None = None
+    # 同批次历史有效恢复版本数量：幂等重发不增加
+    active_recovery_versions: int = 0
+    # 批次内每个 URL 留存的实际响应快照（原批证据 + 后续补采）
+    response_snapshots: dict[str, list[CapturedResponse]] = field(default_factory=dict)
+    # 无响应等原因导致恢复被阻断时，逐 URL 记录未通过原因（不产生占位通过）
+    recovery_blockers: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> StorageBatch:
